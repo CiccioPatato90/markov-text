@@ -10,8 +10,7 @@ typedef struct {
   size_t capacity;
 } Tokens;
 
-#define MARKOV_DEGREE 3
-#define WINDOW_SIZE MARKOV_DEGREE + 1
+#define MARKOV_DEGREE 1
 
 int main() {
   FILE *file = fopen("db.txt", "r");
@@ -57,24 +56,25 @@ int main() {
   fclose(file);
 
   // BUILD MARKOV CHAIN TRANSITION MATRIX
+  int transitions[token_list.count][token_list.count];
   for (size_t i = 0; i < token_list.count; ++i) {
     if(i+MARKOV_DEGREE>token_list.count){
         continue;
     }
-    char context_buffer[512] = "";
+    char state_buffer[512] = "";
     for (int j = 0; j < MARKOV_DEGREE; j++) {
         char *event = token_list.tok[i + j];
         // Append the word to the buffer
-        strcat(context_buffer, event);
+        strcat(state_buffer, event);
         // Add a separator (e.g., a space) if it's not the last word in the context
         if (j < MARKOV_DEGREE - 1) {
-            strcat(context_buffer, ",");
+            strcat(state_buffer, ",");
         }
     }
     // i + markov degree evaluates dynamically based on the lookahead param
     char *effect = token_list.tok[i + MARKOV_DEGREE];
 
-    printf("[TRANSITION] [%s] -> %s\n", context_buffer, effect);
+    printf("[TRANSITION] [%s] -> %s\n", state_buffer, effect);
   }
 
   return 0;
