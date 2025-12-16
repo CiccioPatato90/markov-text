@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     char **tok;
@@ -12,18 +13,32 @@ typedef struct {
 
 #define MARKOV_DEGREE 1
 
+#define da_append(list,value)\
+do {\
+    if ((list).count >= ((list)).capacity) {\
+      if ((list).capacity == 0) {\
+        (list).capacity = 256;\
+      } else {\
+         (list).capacity *= 2;\
+      }\
+      (list).tok = realloc((list).tok,\
+                               (list).capacity * sizeof(*(list).tok));\
+    }\
+    (list).tok[(list).count++] = (value);\
+} while(0);\
+
 
 #define MAX_SIZE 1024
 
-int size = 0; // Current number of elements in the map
+size_t size = 0; // Current number of elements in the map
 char keys[MAX_SIZE][100]; // Array to store the keys
-// Tokens tokens[MAX_SIZE]; // Array to store the tokens
+Tokens tokens[MAX_SIZE]; // Array to store the tokens
 char values[MAX_SIZE][100]; // Array to store the values
 
-// Function to get the index of a key in the keys array
+// Function to get the index of key in the keys array
 int getIndex(char key[])
 {
-    for (int i = 0; i < size; i++) {
+    for (size_t i = 0; i < size; i++) {
         if (strcmp(keys[i], key) == 0) {
             return i;
         }
@@ -37,32 +52,59 @@ void insert(char key[], char value[])
     int index = getIndex(key);
     if (index == -1) { // Key not found
         strcpy(keys[size], key);
-        strcpy(values[size], value);
+        da_append(tokens[size], value);
+        // strcpy(values[size], value);
         size++;
     }
     else { // Key found
-        strcpy(values[index], value);
+        da_append(tokens[index], value);
+        // strcpy(values[index], value);
     }
 }
 
 // Function to get the value of a key in the map
-char* get(char key[])
+Tokens* get(char key[])
 {
     int index = getIndex(key);
+    printf("got index %d\n", index);
     if (index == -1) { // Key not found
         return NULL;
     }
     else { // Key found
-        return values[index];
+        return &tokens[index];
+        // return values[index];
     }
 }
 
 // Function to print the map
 void printMap()
 {
-    for (int i = 0; i < size; i++) {
-        printf("%s: %s\n", keys[i], values[i]);
+    for (size_t i = 0; i < size; i++) {
+        printf("[KEY, VALUES] : [%s] -> [", keys[i]);
+        for (size_t j = 0; j < tokens[i].count; j++) {
+            printf(" %s ", tokens[i].tok[j]);
+        }
+        printf("]\n");
     }
+}
+
+char* pickRandom(char** arr, size_t arr_size)
+{
+    srand(time(NULL));  // seed with current time
+    if (arr_size == 0) return NULL;
+    size_t idx = rand() % arr_size;
+    return arr[idx];
+}
+
+// Theoretically, this should accept the transition matrix.
+// We have set it as a global variable (MAP)
+void predictNext(char** chain, size_t chain_length)
+{
+    char* last_state = chain[chain_length - 1];
+    printf("last state: %s\n", last_state);
+    Tokens* effect = get(last_state);
+    chain[chain_length] = pickRandom(effect->tok, effect->count);
+    printf("Predicted effect: %s\n", chain[chain_length]);
 }
 
 int main() {
@@ -87,21 +129,7 @@ int main() {
       continue;
     } else if (isblank(ch)) {
       current_token[current_idx] = '\0';
-
-      // TOKEN END DETECTED
-      // 1. increment current_window
-      // 2. check if we are at the end of the window
-      // 2.1    if so, we treat the tokens
-      if (token_list.count >= token_list.capacity) {
-        if (token_list.capacity == 0) {
-          token_list.capacity = 256;
-        } else {
-          token_list.capacity *= 2;
-        }
-        token_list.tok = realloc(token_list.tok,
-                                 token_list.capacity * sizeof(*token_list.tok));
-      }
-      token_list.tok[token_list.count++] = strdup(current_token);
+      da_append(token_list, strdup(current_token));
       current_idx = 0;
     }
   }
@@ -140,6 +168,19 @@ int main() {
   }
 
   printMap();
+
+  int max_words = 100;
+  // now predict words
+  char* chain[100] = {0};
+  chain[0] = token_list.tok[0];
+  for(int i=1; i<max_words; i++){
+      predictNext(chain, i);
+  }
+
+  for (size_t i=0; i<max_words; i++) {
+      printf("%s ", chain[i]);
+  }
+
 
   return 0;
 }
