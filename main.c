@@ -11,7 +11,7 @@ typedef struct {
     size_t capacity;
 } Tokens;
 
-#define MARKOV_DEGREE 1
+#define MARKOV_DEGREE 2
 
 #define da_append(list,value)\
 do {\
@@ -88,6 +88,8 @@ void printMap()
     }
 }
 
+// function that chooses a random index in an array.
+// needs as input the array of strings and the array size in order to cap the random value
 char* pickRandom(char** arr, size_t arr_size)
 {
     srand(time(NULL));  // seed with current time
@@ -100,15 +102,36 @@ char* pickRandom(char** arr, size_t arr_size)
 // We have set it as a global variable (MAP)
 void predictNext(char** chain, size_t chain_length)
 {
-    char* last_state = chain[chain_length - 1];
+    printf("chain: %s\n", *chain);
+    printf("chain_length: %zu\n", chain_length);
+    // char* last_state = chain[chain_length - 1];
+    int start_index = chain_length - MARKOV_DEGREE;
+    if(start_index < 0) start_index = 0;
+    char last_state[512] = "";
+    printf("start_index: %d\n", start_index);
+
+    for (int i = 0; i < MARKOV_DEGREE; i++) {
+        strcat(last_state, chain[start_index + i]);
+        if (i < MARKOV_DEGREE - 1) strcat(last_state, " ");
+    }
     printf("last state: %s\n", last_state);
     Tokens* effect = get(last_state);
     chain[chain_length] = pickRandom(effect->tok, effect->count);
     printf("Predicted effect: %s\n", chain[chain_length]);
 }
 
+void create_key(char *buffer, char **source, int start_index, int degree) {
+    buffer[0] = '\0';
+    for (int i = 0; i < degree; i++) {
+        strcat(buffer, source[start_index + i]);
+        if (i < degree - 1) {
+            strcat(buffer, " "); // Use a space consistently
+        }
+    }
+}
+
 int main() {
-  FILE *file = fopen("db.txt", "r");
+  FILE *file = fopen("long.txt", "r");
   if (file == NULL) {
     printf("Error opening file\n");
     return 1;
@@ -152,7 +175,7 @@ int main() {
         strcat(state_buffer, event);
         // Add a separator (e.g., a space) if it's not the last word in the context
         if (j < MARKOV_DEGREE - 1) {
-            strcat(state_buffer, ",");
+            strcat(state_buffer, " ");
         }
     }
 
@@ -164,12 +187,12 @@ int main() {
     }
 
     insert(state_buffer, effect);
-    // printf("[TRANSITION] [%s] -> %s\n", state_buffer, effect);
+    printf("[TRANSITION] [%s] -> %s\n", state_buffer, effect);
   }
 
   printMap();
 
-  int max_words = 100;
+  size_t max_words = 100;
   // now predict words
   char* chain[100] = {0};
   chain[0] = token_list.tok[0];
@@ -178,7 +201,7 @@ int main() {
   }
 
   for (size_t i=0; i<max_words; i++) {
-      printf("%s ", chain[i]);
+      printf("%s ",  chain[i]);
   }
 
 
