@@ -12,7 +12,13 @@ typedef struct {
   size_t capacity;
 } Tokens;
 
-#define MARKOV_DEGREE 5
+#define OUTPUT_WORDS 1000
+#define CHAIN_LENGTH 5
+// set to NULL in case we want to print to stdout
+#define OUTPUT_FILE "output.txt"
+#define INPUT_FILE "long.txt"
+
+#define MARKOV_DEGREE 1
 
 #define da_append(list, value)                                                 \
   do {                                                                         \
@@ -29,9 +35,9 @@ typedef struct {
 
 #define MAX_SIZE 2056
 
-size_t size = 0;            // Current number of elements in the map
-char keys[MAX_SIZE][100];   // Array to store the keys
-Tokens tokens[MAX_SIZE];    // Array to store the tokens
+size_t size = 0;          // Current number of elements in the map
+char keys[MAX_SIZE][100]; // Array to store the keys
+Tokens tokens[MAX_SIZE];  // Array to store the tokens
 
 // Function to get the index of key in the keys array
 int getIndex(char key[]) {
@@ -80,11 +86,24 @@ void printMap() {
   }
 }
 
-void printChain(char **chain, size_t chain_length) {
-  for (size_t i = 0; i < chain_length; i++) {
-    printf("%s ", chain[i]);
+void printChain(char **chain, size_t chain_length, FILE *fout) {
+  if (fout == NULL) {
+    // if the file out pointer is null, we can print directly to stdout
+    for (size_t i = 0; i < chain_length; i++) {
+      printf("%s ", chain[i]);
+    }
+    printf("\n");
+  } else {
+    if (fout == NULL) {
+      printf("[ERROR] Error opening file in printChain()\n");
+      return;
+    }
+
+    for (size_t i = 0; i < chain_length; i++) {
+      fprintf(fout, "%s ", chain[i]);
+    }
+    fprintf(fout, "\n");
   }
-  printf("\n");
 }
 
 // function that chooses a random index in an array.
@@ -109,42 +128,24 @@ void createKey(char *buffer, char **source, int start_index, int degree) {
   }
 }
 
-// void initChain(char **chain) {
-//   char last_state[512] = "";
-//   int random_idx = randomIdx(size);
-//   Tokens* tokens = &tokens[random_idx];
-//   // while (tokens->count == 0) {
-//   //     random_idx = randomIdx(size);
-//   //     tokens = &tokens[random_idx];
-//   // }
-//   char* key = keys[random_idx];
-//   printf("random key: %s\n", key);
-//   printf("random effects: %zu\n", tokens->count);
-//   chain[0] = key;
-//   // createKey(last_state, tokens, 0, MARKOV_DEGREE);
-//   // printf("initial state %s\n", last_state);
-// }
-
 void initChain(char **chain) {
-    // 1. Pick a random index from the map
-    int random_idx = rand() % size;
-    char* random_key = keys[random_idx];
+  // 1. Pick a random index from the map
+  int random_idx = rand() % size;
+  char *random_key = keys[random_idx];
 
-    printf("Seeding with key: [%s]\n", random_key);
+  // 2. We need a temporary copy because strtok modifies the string
+  char temp_key[512];
+  strcpy(temp_key, random_key);
 
-    // 2. We need a temporary copy because strtok modifies the string
-    char temp_key[512];
-    strcpy(temp_key, random_key);
-
-    // 3. Split the key by space and fill the chain
-    char* word = strtok(temp_key, " ");
-    int i = 0;
-    while (word != NULL && i < MARKOV_DEGREE) {
-        // strdup is important here so the chain owns its own strings
-        chain[i] = strdup(word);
-        word = strtok(NULL, " ");
-        i++;
-    }
+  // 3. Split the key by space and fill the chain
+  char *word = strtok(temp_key, " ");
+  int i = 0;
+  while (word != NULL && i < MARKOV_DEGREE) {
+    // strdup is important here so the chain owns its own strings
+    chain[i] = strdup(word);
+    word = strtok(NULL, " ");
+    i++;
+  }
 }
 
 char *predictNext(char **chain, size_t current_len) {
@@ -164,7 +165,7 @@ char *predictNext(char **chain, size_t current_len) {
 
 int main() {
   srand(time(NULL)); // seed with current time
-  FILE *file = fopen("long.txt", "r");
+  FILE *file = fopen(INPUT_FILE, "r");
   if (file == NULL) {
     printf("Error opening file\n");
     return 1;
@@ -176,17 +177,44 @@ int main() {
   char ch;
   char current_token[100];
   int current_idx = 0;
-  while ((ch = fgetc(file)) != EOF) {
-    if (isalpha(ch)) {
-      current_token[current_idx++] = ch;
-    } else if (isdigit(ch)) {
-      continue;
-    } else if (ispunct(ch)) {
-      continue;
-    } else if (isblank(ch)) {
-      current_token[current_idx] = '\0';
-      da_append(token_list, strdup(current_token));
-      current_idx = 0;
+  if (0) {
+    // custom parser
+    while ((ch = fgetc(file)) != EOF) {
+      if (isalpha(ch)) {
+        current_token[current_idx++] = ch;
+      } else if (isdigit(ch)) {
+        continue;
+      } else if (ispunct(ch)) {
+        continue;
+      } else if (isblank(ch)) {
+        current_token[current_idx] = '\0';
+        da_append(token_list, strdup(current_token));
+        current_idx = 0;
+      }
+    }
+  } else {
+    // punctuation parser [GEMINI]
+    while ((ch = fgetc(file)) != EOF) {
+      if (isalpha(ch) || isdigit(ch)) {
+        // Build words/numbers normally
+        current_token[current_idx++] = ch;
+      } else {
+        // 1. We hit something else. If we have a word in the buffer, save it.
+        if (current_idx > 0) {
+          current_token[current_idx] = '\0';
+          da_append(token_list, strdup(current_token));
+          current_idx = 0;
+        }
+
+        // 2. Is this 'something else' punctuation? Save it as a separate token.
+        if (ispunct(ch)) {
+          char punct_str[2] = {ch, '\0'};
+          da_append(token_list, strdup(punct_str));
+        }
+
+        // Note: isblank(ch) or \n just fall through here,
+        // which is good—they separate words without becoming tokens.
+      }
     }
   }
   // Handle the very last token if the file didn't end in a space
@@ -218,29 +246,39 @@ int main() {
     // printf("[TRANSITION] [%s] -> %s\n", state_buffer, effect);
   }
 
-  printMap();
+  // printMap();
+  char *chain[CHAIN_LENGTH] = {0};
 
-  size_t max_words = 100;
-  // now predict words
-  char *chain[100] = {0};
-
-  // ---------------GENERATION LOOP---------------
-  // 1. Seed the chain with the first 'n' tokens from your training data
-  initChain(chain);
-
-  // 2. Generate new words starting from the index after the seed
-  for (size_t i = MARKOV_DEGREE; i < max_words; i++) {
-    char *next_word = predictNext(chain, i);
-
-    if (next_word == NULL) {
-      printf("\n[Chain ended: No further transitions found]\n");
-      break;
+  FILE *fout = NULL;
+  if (OUTPUT_FILE != NULL) {
+    fout = fopen(OUTPUT_FILE, "w");
+    if (fout == NULL) {
+      printf("[ERROR] Could not open %s for writing\n", OUTPUT_FILE);
+      return 1;
     }
-    chain[i] = next_word;
   }
 
-  // print the generated chain !
-  printChain(chain, max_words);
+  for (size_t i = 0; i < OUTPUT_WORDS; i++) {
+    // ---------------GENERATION LOOP---------------
+    // 1. Seed the chain with the first 'n' tokens from your training data
+    initChain(chain);
+    // 2. Generate new words starting from the index after the seed
+    for (size_t i = MARKOV_DEGREE; i < CHAIN_LENGTH; i++) {
+      char *next_word = predictNext(chain, i);
+      if (next_word == NULL) {
+        printf("\n[Chain ended: No further transitions found]\n");
+        break;
+      }
+      chain[i] = next_word;
+    }
+    // print the generated chain !
+    printChain(chain, CHAIN_LENGTH, fout);
+  }
+
+  if (fout != NULL) fclose(fout);
+
+  printf("[SUCCESS] Generated %d chains of %d words. Saved to %s\n",
+         OUTPUT_WORDS, CHAIN_LENGTH, OUTPUT_FILE);
 
   return 0;
 }
