@@ -13,9 +13,9 @@ typedef struct {
 } Tokens;
 
 #define OUTPUT_WORDS 1000
-#define CHAIN_LENGTH 5
+#define CHAIN_LENGTH 20
 // set to NULL in case we want to print to stdout
-#define OUTPUT_FILE "output.txt"
+#define OUTPUT_FILE "../../turin/output.txt"
 #define INPUT_FILE "long.txt"
 
 #define MARKOV_DEGREE 1
@@ -177,7 +177,7 @@ int main() {
   char ch;
   char current_token[100];
   int current_idx = 0;
-  if (0) {
+  if (1) {
     // custom parser
     while ((ch = fgetc(file)) != EOF) {
       if (isalpha(ch)) {
