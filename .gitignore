@@ -1,3 +1,6 @@
-main.dSYM/*
-main
-build/*
+build/
+libs/
+data/db/
+output/
+temp/
+*.dSYM/

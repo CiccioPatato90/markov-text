@@ -1,0 +1,26 @@
+# ============================================================================
+#  markov-db demo — run with `make demo` (starts from a fresh data/db/demo.db)
+# ============================================================================
+
+# --- 1. Incremental, mixed-order training: two documents, different orders --
+:train data/long.txt 3
+:train data/short.txt 2
+:stats size
+:stats growth
+
+# --- 2. Generation: unseeded, seeded continuation, and backoff in action ----
+:gen 3 60
+:gen 3 40 the city
+:gen 2 30
+# order 9 was never trained: every step must back off to order <= 3
+:gen 9 30
+# outputs longer than 500 tokens are written to output/ instead of the console
+:gen 3 800
+
+# --- 3. The OLAP layer: every generation step above was logged --------------
+:stats backoff
+:stats perplexity
+:stats zipf
+:stats entropy
+
+:quit
