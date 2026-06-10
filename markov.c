@@ -5,12 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include "duckdb.h"
 
 #define MAX_ORDER   9
-#define MAX_HISTORY 32768
+#define MAX_HISTORY (1 << 20)
 #define BUF         8192
 
 /* ANSI colours — enabled only when stdout is a terminal, so piped
@@ -24,6 +25,13 @@ static void colors_init(void) {
 }
 
 /* ---------------- small utilities ---------------- */
+
+static char *fmt_si(double v, char *buf) {  /* 2.6M · 947.6K · 93 */
+    if (v >= 1e6)      sprintf(buf, "%.1fM", v / 1e6);
+    else if (v >= 1e3) sprintf(buf, "%.1fK", v / 1e3);
+    else               sprintf(buf, "%.0f", v);
+    return buf;
+}
 
 static double now_sec(void) {
     struct timeval tv;
@@ -169,19 +177,69 @@ static void cmd_train(duckdb_connection con, const char *path, int k) {
     free(esc); free(stage); free(stage_t); free(order_t);
 }
 
-/* ---------------- :gen ---------------- */
+/* ---------------- :gen ----------------
+ * Hybrid: one set-based SELECT loads the model into sorted arrays, the random
+ * walk runs at RAM speed, and the step log is bulk-appended afterwards.
+ * DuckDB stays the system of record; both ends of the loop are batched. */
 
-static const char *SAMPLE_SQL =
-    "SELECT t.next_id, v.token,"
-    "       t.count::DOUBLE / SUM(t.count) OVER () AS prob,"
-    "       COUNT(*) OVER () AS n_candidates "
-    "FROM transitions t JOIN vocabulary v ON v.id = t.next_id "
-    "WHERE t.ord = $1 AND t.state_key = $2 "
-    "ORDER BY random() ^ (1.0 / t.count) DESC LIMIT 1";  /* weighted reservoir */
+typedef struct { char *token; int next_id; long count; } MRow;
+typedef struct { int ord; char *state; long first; int n; long total; } MGroup;
+typedef struct { MRow *rows; MGroup *grp; long nrows, ngrp, bytes; } Model;
 
-static const char *LOG_SQL =
-    "INSERT INTO generation_steps (run_id, step, state_key, order_used,"
-    " chosen_next_id, chosen_prob, n_candidates) VALUES ($1,$2,$3,$4,$5,$6,$7)";
+static Model model_load(duckdb_connection con) {
+    Model m = {0};
+    duckdb_result r;
+    if (duckdb_query(con,
+            "SELECT t.ord, t.state_key, v.token, t.next_id, t.count "
+            "FROM transitions t JOIN vocabulary v ON v.id = t.next_id "
+            "ORDER BY t.ord, t.state_key", &r) == DuckDBError) {
+        fprintf(stderr, "%s[SQL ERROR]%s %s\n", RED, RESET, duckdb_result_error(&r));
+        duckdb_destroy_result(&r);
+        return m;
+    }
+    m.nrows = (long)duckdb_row_count(&r);
+    m.rows  = malloc((size_t)m.nrows * sizeof *m.rows);
+    m.grp   = malloc((size_t)m.nrows * sizeof *m.grp);
+    m.bytes = m.nrows * (long)(sizeof *m.rows + sizeof *m.grp);
+    for (long i = 0; i < m.nrows; i++) {
+        int   ord   = (int)duckdb_value_int64(&r, 0, i);
+        char *state = duckdb_value_varchar(&r, 1, i);
+        char *tok   = duckdb_value_varchar(&r, 2, i);
+        m.rows[i].token   = strdup(tok);
+        m.rows[i].next_id = (int)duckdb_value_int64(&r, 3, i);
+        m.rows[i].count   = (long)duckdb_value_int64(&r, 4, i);
+        m.bytes += (long)strlen(tok) + 1;
+        if (m.ngrp == 0 || ord != m.grp[m.ngrp - 1].ord ||
+            strcmp(state, m.grp[m.ngrp - 1].state) != 0) {
+            MGroup *g = &m.grp[m.ngrp++];
+            g->ord = ord; g->state = strdup(state);
+            g->first = i; g->n = 0; g->total = 0;
+            m.bytes += (long)strlen(state) + 1;
+        }
+        m.grp[m.ngrp - 1].n++;
+        m.grp[m.ngrp - 1].total += m.rows[i].count;
+        duckdb_free(state); duckdb_free(tok);
+    }
+    duckdb_destroy_result(&r);
+    return m;
+}
+
+static void model_free(Model *m) {
+    for (long i = 0; i < m->nrows; i++) free(m->rows[i].token);
+    for (long i = 0; i < m->ngrp; i++) free(m->grp[i].state);
+    free(m->rows); free(m->grp);
+}
+
+static int grp_cmp(const void *a, const void *b) {
+    const MGroup *x = a, *y = b;
+    if (x->ord != y->ord) return x->ord - y->ord;
+    return strcmp(x->state, y->state);   /* matches DuckDB's binary collation */
+}
+
+static MGroup *model_find(Model *m, int ord, const char *state) {
+    MGroup key = { .ord = ord, .state = (char *)state };
+    return bsearch(&key, m->grp, (size_t)m->ngrp, sizeof *m->grp, grp_cmp);
+}
 
 static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *seed) {
     if (k < 1 || k > MAX_ORDER) { fprintf(stderr, "order must be 1..%d\n", MAX_ORDER); return; }
@@ -191,8 +249,8 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
         printf("%s(capped at %ld tokens)%s\n", DIM, max_tokens, RESET);
     }
 
-    char *hist[MAX_HISTORY];
-    int   hlen = 0;
+    char **hist = malloc(MAX_HISTORY * sizeof *hist);
+    int    hlen = 0;
 
     /* seed goes through the SAME tokenization as training */
     if (seed && *seed) {
@@ -229,59 +287,57 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
     }
     long run_id = query_long(con, "SELECT currval('seq_genrun')");
 
-    duckdb_prepared_statement sample, logstep;
-    duckdb_prepare(con, SAMPLE_SQL, &sample);
-    duckdb_prepare(con, LOG_SQL, &logstep);
+    double t0 = now_sec();
+    Model m = model_load(con);
+    char b1[32], b2[32], b3[32];
+    printf("%s ┌─ model: %s transitions · %s states · %sB RAM · loaded in %.3fs%s\n",
+           DIM, fmt_si((double)m.nrows, b1), fmt_si((double)m.ngrp, b2),
+           fmt_si((double)m.bytes, b3), now_sec() - t0, RESET);
+
+    duckdb_appender app;
+    if (duckdb_appender_create(con, NULL, "generation_steps", &app) == DuckDBError) {
+        fprintf(stderr, "%scannot create appender for generation_steps%s\n", RED, RESET);
+        for (int i = 0; i < hlen; i++) free(hist[i]);
+        free(hist); model_free(&m);
+        return;
+    }
 
     int tokens = 0;
     const char *why = "token limit";
-    double t0 = now_sec();
+    double t1 = now_sec();
     for (long step = 0; step < max_tokens; step++) {
         char state[BUF];
-        char *token = NULL;
-        long next_id = 0, n_cand = 0;
-        double prob = 0;
+        MGroup *g = NULL;
         int used = 0;
 
         /* backoff: longest context we have data for wins */
-        for (int ord = (hlen < k ? hlen : k); ord >= 1; ord--) {
+        for (int ord = (hlen < k ? hlen : k); ord >= 1 && !g; ord--) {
             state[0] = '\0';
             for (int i = hlen - ord; i < hlen; i++) {
                 if (i > hlen - ord) strlcat(state, " ", sizeof state);
                 strlcat(state, hist[i], sizeof state);
             }
-            duckdb_bind_int32(sample, 1, ord);
-            duckdb_bind_varchar(sample, 2, state);
-            duckdb_result r;
-            if (duckdb_execute_prepared(sample, &r) != DuckDBError &&
-                duckdb_row_count(&r) == 1) {
-                next_id = (long)duckdb_value_int64(&r, 0, 0);
-                char *t = duckdb_value_varchar(&r, 1, 0);
-                token   = strdup(t);
-                duckdb_free(t);
-                prob    = duckdb_value_double(&r, 2, 0);
-                n_cand  = (long)duckdb_value_int64(&r, 3, 0);
-                used    = ord;
-                duckdb_destroy_result(&r);
-                break;
-            }
-            duckdb_destroy_result(&r);
+            if ((g = model_find(&m, ord, state)) != NULL) used = ord;
         }
-        if (!token) { why = "dead end (state unseen at every order)"; break; }
+        if (!g) { why = "dead end (state unseen at every order)"; break; }
 
-        duckdb_bind_int64(logstep, 1, run_id);
-        duckdb_bind_int32(logstep, 2, (int)step);
-        duckdb_bind_varchar(logstep, 3, state);
-        duckdb_bind_int32(logstep, 4, used);
-        duckdb_bind_int64(logstep, 5, next_id);
-        duckdb_bind_double(logstep, 6, prob);
-        duckdb_bind_int32(logstep, 7, (int)n_cand);
-        duckdb_result lr;
-        duckdb_execute_prepared(logstep, &lr);
-        duckdb_destroy_result(&lr);
+        /* weighted draw within the group: P(next) = count / total */
+        long draw = (long)(rand() / ((double)RAND_MAX + 1) * (double)g->total);
+        long idx = g->first;
+        while (draw >= m.rows[idx].count) { draw -= m.rows[idx].count; idx++; }
+        MRow *row = &m.rows[idx];
 
-        hist[hlen++] = token;
-        if (strcmp(token, "</s>") == 0) {
+        duckdb_append_int32(app, (int32_t)run_id);
+        duckdb_append_int32(app, (int32_t)step);
+        duckdb_append_varchar(app, state);
+        duckdb_append_int8(app, (int8_t)used);
+        duckdb_append_int32(app, row->next_id);
+        duckdb_append_double(app, (double)row->count / (double)g->total);
+        duckdb_append_int32(app, (int32_t)g->n);
+        duckdb_appender_end_row(app);
+
+        hist[hlen++] = strdup(row->token);
+        if (strcmp(row->token, "</s>") == 0) {
             /* sentence boundary, not a stop: open a fresh <s> context and go on */
             if (hlen >= MAX_HISTORY - 1) { why = "history limit"; break; }
             hist[hlen++] = strdup("<s>");
@@ -290,10 +346,10 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
         tokens++;
         if (hlen >= MAX_HISTORY) { why = "history limit"; break; }
     }
-    double dt = now_sec() - t0;
+    double dt = now_sec() - t1;
 
-    duckdb_destroy_prepare(&sample);
-    duckdb_destroy_prepare(&logstep);
+    duckdb_appender_destroy(&app);   /* flushes the whole step log in one batch */
+    model_free(&m);
 
     /* long outputs go to a file keyed by run id instead of flooding the console */
     FILE *out = stdout;
@@ -320,9 +376,10 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
         printf("output is %d tokens — full text written to %s%s%s\n",
                tokens, BOLD, outpath, RESET);
     }
-    printf("%s └─ run %ld · order %d · %d token%s · %.2fs · %.0f tok/s · stopped at %s%s\n",
-           DIM, run_id, k, tokens, tokens == 1 ? "" : "s", dt,
-           dt > 0 ? tokens / dt : 0.0, why, RESET);
+    free(hist);
+    printf("%s └─ run %ld · order %d · %s tokens · gen %.3fs · %s tok/s · stopped at %s%s\n",
+           DIM, run_id, k, fmt_si((double)tokens, b1), dt,
+           fmt_si(dt > 0 ? tokens / dt : 0.0, b2), why, RESET);
 }
 
 /* ---------------- :stats ---------------- */
@@ -349,8 +406,11 @@ static const struct { const char *name; const char *sql; } STATS[] = {
       "FROM p GROUP BY ord, state_key HAVING COUNT(*) > 1 "
       "ORDER BY entropy_bits DESC LIMIT 20" },
     { "size",
-      "SELECT ord, COUNT(*) AS transitions, COUNT(DISTINCT state_key) AS states "
-      "FROM transitions GROUP BY ord ORDER BY ord" },
+      "SELECT t.ord, COUNT(*) AS transitions, COUNT(DISTINCT t.state_key) AS states,"
+      " format_bytes(SUM(length(t.state_key) + 13)::BIGINT) AS model_size,"
+      " (SELECT string_agg(DISTINCT d.name, ', ') FROM training_runs tr"
+      "  JOIN documents d ON d.id = tr.document_id WHERE tr.ord = t.ord) AS trained_on "
+      "FROM transitions t GROUP BY t.ord ORDER BY t.ord" },
     { "growth",
       "SELECT tr.id AS run, d.name, tr.ord, tr.ngrams_added,"
       " SUM(tr.ngrams_added) OVER (ORDER BY tr.id) AS cumulative_ngrams "
@@ -385,6 +445,7 @@ static void help(void) {
 }
 
 int main(int argc, char **argv) {
+    srand((unsigned)time(NULL));
     const char *db_path = argc > 1 ? argv[1] : "data/db/markov.db";
     duckdb_database   db;
     duckdb_connection con;
