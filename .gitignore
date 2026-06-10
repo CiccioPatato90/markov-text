@@ -1,6 +1,9 @@
 build/
 libs/
 data/db/
+markov-v*/
+markov-v*.zip
+probe/
 output/
 temp/
 *.dSYM/

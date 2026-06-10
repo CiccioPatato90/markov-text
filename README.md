@@ -83,10 +83,18 @@ curl -L -o /tmp/libduckdb.zip \
   "https://github.com/duckdb/duckdb/releases/download/v${VER}/libduckdb-osx-universal.zip"
 unzip -o /tmp/libduckdb.zip -d libs/macos      # -> libs/macos/{duckdb.h, duckdb.hpp, libduckdb.dylib}
 # (on Linux: the libduckdb-linux-amd64.zip into libs/linux — the Makefile picks per-OS)
+curl -L -o /tmp/libduckdb.zip \
+  "https://github.com/duckdb/duckdb/releases/download/v${VER}/libduckdb-linux-amd64.zip"
+unzip -o /tmp/libduckdb.zip -d libs/linux      # -> libs/macos/{duckdb.h, duckdb.hpp, libduckdb.dylib}
 
 # --- DuckDB CLI (handy for verifying SQL by hand) ---
 curl -L -o /tmp/duckdb-cli.zip \
   "https://github.com/duckdb/duckdb/releases/download/v${VER}/duckdb_cli-osx-universal.zip"
+unzip -o /tmp/duckdb-cli.zip -d libs           # -> libs/duckdb (CLI binary)
+
+# --- DuckDB CLI LINUX (handy for verifying SQL by hand) ---
+curl -L -o /tmp/duckdb-cli.zip \
+  "https://github.com/duckdb/duckdb/releases/download/v${VER}/duckdb_cli-linux-amd64.zip"
 unzip -o /tmp/duckdb-cli.zip -d libs           # -> libs/duckdb (CLI binary)
 ```
 
