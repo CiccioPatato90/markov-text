@@ -22,7 +22,7 @@
 static int db_exec(duckdb_connection con, const char *sql) {
     duckdb_result r;
     if (duckdb_query(con, sql, &r) == DuckDBError) {
-        fprintf(stderr, "%s[SQL ERROR]%s %s\n", RED, RESET, duckdb_result_error(&r));
+        mu_warn("[SQL ERROR] %s", duckdb_result_error(&r));
         duckdb_destroy_result(&r);
         return 1;
     }
@@ -73,37 +73,81 @@ static long query_long(duckdb_connection con, const char *sql) {
 
 /* ---------------- :train ---------------- */
 
-static void cmd_train(duckdb_connection con, const char *path, int k) {
-    if (k < 1 || k > MAX_ORDER) { fprintf(stderr, "order must be 1..%d\n", MAX_ORDER); return; }
+/* Reader SQL for the {{READER}} slot in train_stage.sql: every source must
+ * yield a single `content` column. Tabular sources (parquet/csv) emit one
+ * row per record from column `col`; everything else is read as raw text. */
+static void build_reader(const char *path_esc, const char *col, char *out, size_t outsz) {
+    const char *ext = strrchr(path_esc, '.');
+    if (ext && strcasecmp(ext, ".parquet") == 0)
+        snprintf(out, outsz,
+                 "SELECT \"%s\"::VARCHAR AS content FROM read_parquet('%s')", col, path_esc);
+    else if (ext && strcasecmp(ext, ".csv") == 0)
+        snprintf(out, outsz,
+                 "SELECT \"%s\"::VARCHAR AS content FROM read_csv('%s')", col, path_esc);
+    else
+        snprintf(out, outsz, "SELECT content FROM read_text('%s')", path_esc);
+}
+
+static void cmd_train(duckdb_connection con, const char *path, int k, char *col, int force) {
+    if (k < 1 || k > MAX_ORDER) { mu_warn("order must be 1..%d", MAX_ORDER); return; }
     /* read_text() returns 0 rows for a missing file instead of erroring,
      * which would silently record a 0-token training run */
     struct stat st;
     if (stat(path, &st) != 0) {
-        fprintf(stderr, "%scannot find %s%s — paths are relative to the working directory\n",
-                RED, path, RESET);
+        mu_warn("cannot find %s — paths are relative to the working directory", path);
         return;
     }
+    /* column name lands inside double quotes in the reader SQL */
+    for (char *p = col; *p; p++) if (*p == '"') *p = '_';
 
-    char *esc   = mu_str_replace(path, "'", "''");
-    char *stage = mu_str_replace(train_stage_sql, "{{PATH}}", esc);
-    double t0   = mu_now_sec();
+    char *esc = mu_str_replace(path, "'", "''");
+
+    /* double-count guard: the n-gram merge is additive (ON CONFLICT adds
+     * counts), so training the same document twice doubles its weight in
+     * the model with no way to undo it short of :reset */
+    if (!force) {
+        char q[1200];
+        snprintf(q, sizeof q, "SELECT COUNT(*) FROM documents WHERE name = '%s'", esc);
+        if (query_long(con, q) > 0) {
+            mu_warn("%s is already in this model — training it again would double its counts", path);
+            mu_info(":train! forces a repeat; :reset rebuilds the model from scratch");
+            free(esc);
+            return;
+        }
+    }
+
+    char reader[2048];
+    build_reader(esc, col, reader, sizeof reader);
+    char *with_reader = mu_str_replace(train_stage_sql, "{{READER}}", reader);
+    char *stage       = mu_str_replace(with_reader, "{{PATH}}", esc);
+    free(with_reader);
+    char b1[32];
+    double t0 = mu_now_sec();
+    mu_progress("staging %s … ", path);
     if (db_exec(con, stage) == 0) {
+        printf("%s tokens in %.1fs\n",
+               mu_fmt_si((double)query_long(con, "SELECT COUNT(*) FROM doc_tokens"), b1),
+               mu_now_sec() - t0);
         /* train every order 1..k so backoff never hits an untrained order */
         for (int ord = 1; ord <= k; ord++) {
-            char kbuf[8], kmbuf[8];
+            char kbuf[8], kmbuf[8], q[128];
             snprintf(kbuf, sizeof kbuf, "%d", ord);
             snprintf(kmbuf, sizeof kmbuf, "%d", ord - 1);
             char *s1 = mu_str_replace(train_order_sql, "{{K}}", kbuf);
             char *s2 = mu_str_replace(s1, "{{KM1}}", kmbuf);
-            if (db_exec(con, s2)) { free(s1); free(s2); break; }
+            mu_progress("  order %d merge … ", ord);
+            double t1 = mu_now_sec();
+            if (db_exec(con, s2)) { printf("failed\n"); free(s1); free(s2); break; }
             free(s1); free(s2);
+            snprintf(q, sizeof q, "SELECT ngrams_added FROM training_runs"
+                     " WHERE document_id = currval('seq_doc') AND ord = %d", ord);
+            printf("%s n-grams in %.1fs\n",
+                   mu_fmt_si((double)query_long(con, q), b1), mu_now_sec() - t1);
         }
-        printf("trained %s — %ld tokens staged in %.2fs, n-grams merged per order:\n",
-               path, query_long(con, "SELECT COUNT(*) FROM doc_tokens"),
-               mu_now_sec() - t0);
-        run_and_print(con,
-            "SELECT ord AS \"order\", ngrams_added FROM training_runs"
-            " WHERE document_id = currval('seq_doc') ORDER BY ord");
+        printf("trained %s%s%s at orders 1..%d in %.1fs total\n",
+               BOLD, path, RESET, k, mu_now_sec() - t0);
+    } else {
+        printf("failed\n");
     }
     free(esc); free(stage);
 }
@@ -117,14 +161,18 @@ typedef struct { char *token; int next_id; long count; } MRow;
 typedef struct { int ord; char *state; long first; int n; long total; } MGroup;
 typedef struct { MRow *rows; MGroup *grp; long nrows, ngrp, bytes; } Model;
 
-static Model model_load(duckdb_connection con) {
+static Model model_load(duckdb_connection con, int k) {
     Model m = {0};
     duckdb_result r;
-    if (duckdb_query(con,
-            "SELECT t.ord, t.state_key, v.token, t.next_id, t.count "
-            "FROM transitions t JOIN vocabulary v ON v.id = t.next_id "
-            "ORDER BY t.ord, t.state_key", &r) == DuckDBError) {
-        fprintf(stderr, "%s[SQL ERROR]%s %s\n", RED, RESET, duckdb_result_error(&r));
+    char sql[256];
+    /* only orders <= k — backoff can never ask for more, and on big models
+     * the higher orders are the bulk of the rows */
+    snprintf(sql, sizeof sql,
+             "SELECT t.ord, t.state_key, v.token, t.next_id, t.count "
+             "FROM transitions t JOIN vocabulary v ON v.id = t.next_id "
+             "WHERE t.ord <= %d ORDER BY t.ord, t.state_key", k);
+    if (duckdb_query(con, sql, &r) == DuckDBError) {
+        mu_warn("[SQL ERROR] %s", duckdb_result_error(&r));
         duckdb_destroy_result(&r);
         return m;
     }
@@ -177,7 +225,7 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
     if (max_tokens < 1) max_tokens = 50;
     if (max_tokens > MAX_HISTORY - 64) {   /* every step is a SELECT + INSERT */
         max_tokens = MAX_HISTORY - 64;
-        printf("%s(capped at %ld tokens)%s\n", DIM, max_tokens, RESET);
+        mu_info("(capped at %ld tokens)", max_tokens);
     }
 
     char **hist = malloc(MAX_HISTORY * sizeof *hist);
@@ -218,16 +266,28 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
     }
     long run_id = query_long(con, "SELECT currval('seq_genrun')");
 
+    /* RAM estimate before loading — ~80 bytes/transition measured from
+     * m.bytes on real models; over ~1 GiB the right move is :prune */
+    {
+        char cq[96], e1[32], e2[32];
+        snprintf(cq, sizeof cq, "SELECT COUNT(*) FROM transitions WHERE ord <= %d", k);
+        long nrows = query_long(con, cq);
+        if (nrows * 80 > (1L << 30))
+            mu_warn("loading %s transitions needs roughly %sB RAM — "
+                    ":prune <min-count> shrinks the model",
+                    mu_fmt_si((double)nrows, e1), mu_fmt_si(nrows * 80.0, e2));
+    }
+
     double t0 = mu_now_sec();
-    Model m = model_load(con);
+    Model m = model_load(con, k);
     char b1[32], b2[32], b3[32];
-    printf("%s ┌─ model: %s transitions · %s states · %sB RAM · loaded in %.3fs%s\n",
-           DIM, mu_fmt_si((double)m.nrows, b1), mu_fmt_si((double)m.ngrp, b2),
-           mu_fmt_si((double)m.bytes, b3), mu_now_sec() - t0, RESET);
+    mu_info(" ┌─ model: %s transitions · %s states · %sB RAM · loaded in %.3fs",
+            mu_fmt_si((double)m.nrows, b1), mu_fmt_si((double)m.ngrp, b2),
+            mu_fmt_si((double)m.bytes, b3), mu_now_sec() - t0);
 
     duckdb_appender app;
     if (duckdb_appender_create(con, NULL, "generation_steps", &app) == DuckDBError) {
-        fprintf(stderr, "%scannot create appender for generation_steps%s\n", RED, RESET);
+        mu_warn("cannot create appender for generation_steps");
         for (int i = 0; i < hlen; i++) free(hist[i]);
         free(hist); model_free(&m);
         return;
@@ -290,7 +350,7 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
         snprintf(outpath, sizeof outpath, "output/run_%ld.txt", run_id);
         out = fopen(outpath, "w");
         if (!out) {
-            fprintf(stderr, "%scannot write %s%s\n", RED, outpath, RESET);
+            mu_warn("cannot write %s", outpath);
             out = stdout; outpath[0] = '\0';
         }
     }
@@ -308,9 +368,45 @@ static void cmd_gen(duckdb_connection con, int k, long max_tokens, const char *s
                tokens, BOLD, outpath, RESET);
     }
     free(hist);
-    printf("%s └─ run %ld · order %d · %s tokens · gen %.3fs · %s tok/s · stopped at %s%s\n",
-           DIM, run_id, k, mu_fmt_si((double)tokens, b1), dt,
-           mu_fmt_si(dt > 0 ? tokens / dt : 0.0, b2), why, RESET);
+    mu_info(" └─ run %ld · order %d · %s tokens · gen %.3fs · %s tok/s · stopped at %s",
+            run_id, k, mu_fmt_si((double)tokens, b1), dt,
+            mu_fmt_si(dt > 0 ? tokens / dt : 0.0, b2), why);
+}
+
+/* ---------------- :prune ----------------
+ * Drop transitions seen fewer than min_count times. On natural-language
+ * corpora the singletons dominate the table (Zipf: 83% of order-2 rows on
+ * wikitext-103) but carry little generation value; pruning shrinks the model
+ * 10-50x. Backoff degrades gracefully — a pruned higher-order state simply
+ * falls through to a lower order. Destructive but recoverable: retraining
+ * the same corpus rebuilds the counts. */
+
+static void cmd_prune(duckdb_connection con, long min_count) {
+    if (min_count < 2) { fprintf(stderr, "min-count must be >= 2\n"); return; }
+    long before = query_long(con, "SELECT COUNT(*) FROM transitions");
+    /* rebuild instead of DELETE: deleting ~90% of an indexed table pays
+     * per-row ART maintenance plus MVCC versioning of everything removed
+     * (minutes on tens of millions of rows); copying the surviving ~10%
+     * out, dropping the table and inserting back is set-based and fast.
+     * schema_sql recreates transitions (everything in it is IF NOT EXISTS). */
+    char sql[256];
+    snprintf(sql, sizeof sql,
+        "CREATE OR REPLACE TEMP TABLE kept AS"
+        "  SELECT * FROM transitions WHERE count >= %ld;"
+        "DROP TABLE transitions;", min_count);
+    double t0 = mu_now_sec();
+    if (db_exec(con, sql) || db_exec(con, schema_sql) ||
+        db_exec(con, "INSERT INTO transitions SELECT * FROM kept; DROP TABLE kept;") ||
+        db_exec(con, "CHECKPOINT"))
+        return;
+    long after = query_long(con, "SELECT COUNT(*) FROM transitions");
+    char b1[32], b2[32];
+    printf("pruned count < %ld: %s -> %s transitions in %.2fs, per order:\n",
+           min_count, mu_fmt_si((double)before, b1), mu_fmt_si((double)after, b2),
+           mu_now_sec() - t0);
+    run_and_print(con,
+        "SELECT ord, COUNT(*) AS transitions, COUNT(DISTINCT state_key) AS states"
+        " FROM transitions GROUP BY ord ORDER BY ord");
 }
 
 /* ---------------- :stats ---------------- */
@@ -352,9 +448,12 @@ static const struct { const char *name; const char *sql; } STATS[] = {
 static void cmd_stats(duckdb_connection con, const char *name) {
     for (size_t i = 0; i < N_STATS; i++)
         if (strcmp(name, STATS[i].name) == 0) { run_and_print(con, STATS[i].sql); return; }
-    fprintf(stderr, "%sunknown stat '%s'%s; available:", RED, name, RESET);
-    for (size_t i = 0; i < N_STATS; i++) fprintf(stderr, " %s", STATS[i].name);
-    fprintf(stderr, "\n");
+    char list[256] = "";
+    for (size_t i = 0; i < N_STATS; i++) {
+        strlcat(list, " ", sizeof list);
+        strlcat(list, STATS[i].name, sizeof list);
+    }
+    mu_warn("unknown stat '%s'; available:%s", name, list);
 }
 
 /* ---------------- :reset / :help / REPL ---------------- */
@@ -367,21 +466,26 @@ static const char *RESET_SQL =  /* children first (FK dependency order) */
     "DROP SEQUENCE IF EXISTS seq_trainrun; DROP SEQUENCE IF EXISTS seq_genrun;";
 
 static void help(void) {
-    printf("%s:train <file> <order>%s     tokenize <file>, merge n-grams at every order 1..<order>\n"
-           "%s:gen <order> [n] [seed…]%s  generate up to n tokens (default 50), optional seed phrase\n"
-           "%s:stats <name>%s             zipf | backoff | perplexity | entropy | size | growth\n"
-           "%s:reset%s                    drop and recreate the schema (model starts empty)\n"
+    printf("%s:train <file> <order> [col]%s  tokenize <file>, merge n-grams at every order 1..<order>\n"
+           "                             .txt = raw text; .parquet/.csv read column [col] (default: text)\n"
+           "                             refuses a file already in the model; :train! forces the repeat\n"
+           "%s:gen <order> [n] [seed…]%s     generate up to n tokens (default 50), optional seed phrase\n"
+           "%s:prune <min-count>%s           drop transitions seen fewer than <min-count> times (shrinks model)\n"
+           "%s:stats <name>%s                zipf | backoff | perplexity | entropy | size | growth\n"
+           "%s:reset%s                       drop and recreate the schema (model starts empty)\n"
            "%s:help / :quit%s\n"
            "\n"
            "example session:\n"
-           "  :train books.txt 3        train orders 1..3 on books.txt\n"
-           "  :gen 3 100 to be or       100 tokens, order-3 backoff, seeded\n"
-           "  :stats size               how big the model is per order\n"
+           "  :train books.txt 3           train orders 1..3 on books.txt\n"
+           "  :train corpus.parquet 2 text train on a parquet text column (wikitext-style)\n"
+           "  :prune 3                     keep only transitions seen 3+ times\n"
+           "  :gen 3 100 to be or          100 tokens, order-3 backoff, seeded\n"
+           "  :stats size                  how big the model is per order\n"
            "\n"
            "file paths are relative to the directory markov was started from.\n"
            "the model persists in the database file (default data/db/markov.db;\n"
            "pass another path as the first argument: ./markov mymodel.db).\n",
-           BOLD, RESET, BOLD, RESET, BOLD, RESET, BOLD, RESET, BOLD, RESET);
+           BOLD, RESET, BOLD, RESET, BOLD, RESET, BOLD, RESET, BOLD, RESET, BOLD, RESET);
 }
 
 int main(int argc, char **argv) {
@@ -410,15 +514,28 @@ int main(int argc, char **argv) {
     while (printf("%smarkov>%s ", CYAN, RESET), fflush(stdout),
            fgets(line, sizeof line, stdin)) {
         line[strcspn(line, "\n")] = '\0';
-        /* scripted runs (make demo): echo commands, treat # lines as narration */
-        if (!interactive)
+        /* scripted runs (make demo): echo commands, treat # lines as narration;
+         * flush so stderr warnings can't jump ahead of the echo when piped */
+        if (!interactive) {
             printf("%s%s%s\n", line[0] == '#' ? DIM : BOLD, line, RESET);
+            fflush(stdout);
+        }
         if (line[0] == '#') continue;
-        char path[1024], name[64], seed[BUF];
+        char path[1024], name[64], seed[BUF], col[64] = "text";
         int k;
         long n;
-        if (sscanf(line, ":train %1023s %d", path, &k) == 2) {
-            cmd_train(con, path, k);
+        if (!strncmp(line, ":train", 6)) {
+            int force = line[6] == '!';
+            if (sscanf(line, force ? ":train! %1023s %d %63s" : ":train %1023s %d %63s",
+                       path, &k, col) >= 2)
+                cmd_train(con, path, k, col, force);
+            else
+                fprintf(stderr, "usage: :train[!] <file> <order> [col]\n");
+        } else if (!strncmp(line, ":prune", 6)) {
+            if (sscanf(line, ":prune %ld", &n) == 1)
+                cmd_prune(con, n);
+            else
+                fprintf(stderr, "usage: :prune <min-count>\n");
         } else if (!strncmp(line, ":gen", 4)) {
             n = 50; seed[0] = '\0';
             if (sscanf(line, ":gen %d %ld %[^\n]", &k, &n, seed) >= 2 ||
@@ -442,7 +559,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(line, ":quit") || !strcmp(line, ":q")) {
             break;
         } else if (line[0]) {
-            fprintf(stderr, "%sunknown command%s — :help lists them\n", RED, RESET);
+            mu_warn("unknown command — :help lists them");
         }
     }
 

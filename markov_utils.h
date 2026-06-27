@@ -10,7 +10,7 @@
 #include <stddef.h>
 
 /* program version — deploy.sh reads this to name the release package */
-#define MARKOV_VERSION "1.1.0"
+#define MARKOV_VERSION "1.3.0"
 
 /* ANSI colours — empty strings until mu_colors_init() sees a terminal, so
  * piped transcripts (make demo > file) stay free of escape codes */
@@ -33,10 +33,23 @@ char *mu_str_replace(const char *src, const char *needle, const char *repl);
  * is_num[c] right-aligns column c; cells are not freed */
 void mu_print_table(char **cell, size_t nc, size_t nr, const int *is_num);
 
+/* ---- message helpers: one line, colour-wrapped, printf-style ---- */
+
+/* red line to stderr (warnings/errors) */
+void mu_warn(const char *fmt, ...);
+
+/* dim line to stdout (secondary status) */
+void mu_info(const char *fmt, ...);
+
+/* in-flight progress: prints without newline and flushes, so a long
+ * operation can complete the line later ("staging … " + "done in 3s") */
+void mu_progress(const char *fmt, ...);
+
 #endif /* MARKOV_UTILS_H */
 
 #ifdef MARKOV_UTILS_IMPLEMENTATION
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,6 +99,31 @@ char *mu_str_replace(const char *src, const char *needle, const char *repl) {
     }
     strcpy(o, p);
     return out;
+}
+
+static void mu__line(FILE *f, const char *color, const char *fmt, va_list ap) {
+    fprintf(f, "%s", color);
+    vfprintf(f, fmt, ap);
+    fprintf(f, "%s\n", RESET);
+}
+
+void mu_warn(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    mu__line(stderr, RED, fmt, ap);
+    va_end(ap);
+}
+
+void mu_info(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    mu__line(stdout, DIM, fmt, ap);
+    va_end(ap);
+}
+
+void mu_progress(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
 }
 
 void mu_print_table(char **cell, size_t nc, size_t nr, const int *is_num) {
